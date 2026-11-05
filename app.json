@@ -1,0 +1,49 @@
+{
+  "expo": {
+    "name": "Climate Smart Farmer Advisory",
+    "slug": "climate-smart-farmer-advisory",
+    "version": "1.0.0",
+    "scheme": "climatesmartfarmer",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0F9D58"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ],
+      "package": "com.usernamebro.climatesmartfarmeradvisory"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow the app to use your location to show weather for your farm."
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "6a1f22a2-8a49-403c-9667-05ae3700ea56"
+      }
+    }
+  }
+}

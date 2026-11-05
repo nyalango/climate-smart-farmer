@@ -1,0 +1,111 @@
+// src/screens/WeekScreen.js
+import React, { useState, useEffect } from 'react';
+import {
+  View, Text, ScrollView, RefreshControl,
+  StyleSheet, ActivityIndicator,
+} from 'react-native';
+import { ForecastDayTile } from '../components/ForecastTile';
+import { Colors, alertColor, alertTextColor } from '../theme/colors';
+import { getWeekly } from '../services/weatherService';
+import { Ionicons } from '@expo/vector-icons';
+
+export default function WeekScreen({ route }) {
+  const { location = 'kampala', lang = 'en' } = route.params || {};
+
+  const [forecast,   setForecast]   = useState(null);
+  const [loading,    setLoading]    = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+
+  useEffect(() => { load(); }, []);
+
+  async function load(isRefresh = false) {
+    if (isRefresh) setRefreshing(true);
+    else setLoading(true);
+
+    const data = await getWeekly(location, lang);
+    setForecast(data);
+
+    setLoading(false);
+    setRefreshing(false);
+  }
+
+  if (loading) {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator size="large" color={Colors.primary} />
+        <Text style={styles.loadingText}>Loading 7-day forecast...</Text>
+      </View>
+    );
+  }
+
+  if (!forecast) {
+    return (
+      <View style={styles.center}>
+        <Ionicons name="cloud-offline-outline" size={48} color={Colors.textLight} />
+        <Text style={styles.errorTitle}>Could not load forecast</Text>
+        <Text style={styles.errorSub}>Check your connection and try again.</Text>
+      </View>
+    );
+  }
+
+  const highestLevel = (forecast.highest_alert || 'info')
+    .toString().split('.').pop();
+  const summaryBg  = alertColor(highestLevel);
+  const summaryFg  = alertTextColor(highestLevel);
+
+  return (
+    <ScrollView
+      style={styles.container}
+      contentContainerStyle={styles.content}
+      refreshControl={
+        <RefreshControl
+          refreshing={refreshing}
+          onRefresh={() => load(true)}
+          colors={[Colors.primary]}
+          tintColor={Colors.primary}
+        />
+      }
+    >
+      <Text style={styles.title}>{forecast.location_name}</Text>
+
+      <View style={[styles.summaryBadge, { backgroundColor: summaryBg }]}>
+        <Ionicons name="warning" size={16} color={summaryFg} style={{ marginRight: 6 }} />
+        <Text style={[styles.summaryText, { color: summaryFg }]}>
+          Highest alert this week: {highestLevel.toUpperCase()}
+        </Text>
+      </View>
+
+      {(forecast.days || []).map((day, i) => (
+        <ForecastDayTile key={day.date || i} day={day} index={i} />
+      ))}
+
+      <Text style={styles.hint}>Tap a day to see farming advice</Text>
+    </ScrollView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container : { flex: 1, backgroundColor: Colors.background },
+  content   : { padding: 16, paddingBottom: 32 },
+  center    : {
+    flex: 1, justifyContent: 'center', alignItems: 'center',
+    padding: 32, backgroundColor: Colors.background,
+  },
+  title: {
+    fontSize: 22, fontWeight: '700',
+    color: Colors.textDark, marginBottom: 12,
+  },
+  summaryBadge: {
+    flexDirection: 'row', alignItems: 'center',
+    borderRadius: 12, paddingVertical: 12,
+    paddingHorizontal: 16, marginBottom: 16,
+  },
+  summaryText: { fontSize: 14, fontWeight: '600' },
+  hint: {
+    textAlign: 'center', fontSize: 12,
+    color: Colors.textLight, marginTop: 8,
+  },
+  loadingText: { marginTop: 12, color: Colors.textMid },
+  errorTitle : { fontSize: 18, fontWeight: '600', marginTop: 12, marginBottom: 8 },
+  errorSub   : { textAlign: 'center', color: Colors.textMid },
+});
