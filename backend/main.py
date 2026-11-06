@@ -498,32 +498,153 @@ def _persistent_forecast_set(key: tuple, payload: dict) -> None:
         log.exception("Could not save persistent weather cache")
 
 
+
 async def forecast(lat: float, lon: float) -> dict:
     global _weather_rate_limited_until
 
     key = (round(lat, 2), round(lon, 2))
     now = time.time()
 
-    # Check process memory first, then PostgreSQL. PostgreSQL survives restarts.
+    # Check memory first, then PostgreSQL.
     cached = _forecast_cache.get(key)
+
     if cached is None:
         cached = _persistent_forecast_get(key)
         if cached is not None:
             _forecast_cache[key] = cached
 
-    # Return fresh cached weather without contacting Open-Meteo.
+    # Use fresh cached weather without contacting the provider.
     if cached and now - cached[0] < FORECAST_TTL:
         return cached[1]
 
-    # During a provider cooldown, return the last saved forecast if it is
-    # no more than 24 hours old.
+    # Use an older forecast during provider cooldown if available.
     if now < _weather_rate_limited_until:
         if cached and now - cached[0] < FORECAST_STALE_TTL:
+            log.warning("Weather provider cooldown: returning cached forecast.")
             return cached[1]
+
         raise HTTPException(
             status_code=503,
             detail="Weather service is temporarily busy. Please try again later."
         )
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": "auto",
+        "forecast_days": 7,
+        "daily": (
+            "weather_code,temperature_2m_max,temperature_2m_min,"
+            "precipitation_sum,precipitation_probability_max,"
+            "wind_speed_10m_max"
+        ),
+        "current": (
+            "temperature_2m,relative_humidity_2m,"
+            "wind_speed_10m,weather_code"
+        ),
+    }
+
+    try:
+        timeout = httpx.Timeout(25.0, connect=10.0)
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params=params,
+            )
+
+        # Handle rate limiting explicitly.
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+
+            log.error(
+                "Open-Meteo RATE LIMIT: status=429, retry_after=%s, response=%s",
+                retry_after,
+                response.text[:500],
+            )
+
+            try:
+                wait_seconds = int(retry_after)
+                wait_seconds = max(900, min(wait_seconds, 21600))
+            except (TypeError, ValueError):
+                wait_seconds = 1800
+
+            _weather_rate_limited_until = time.time() + wait_seconds
+
+            if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
+                log.warning("Returning stale weather forecast after rate limit.")
+                return cached[1]
+
+            raise HTTPException(
+                status_code=503,
+                detail="Weather service is temporarily busy. Please try again later."
+            )
+
+        # Log other provider errors before raising them.
+        if response.status_code >= 400:
+            log.error(
+                "Open-Meteo HTTP error: status=%s, response=%s",
+                response.status_code,
+                response.text[:500],
+            )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        # Validate the response before caching it.
+        daily = data.get("daily") if isinstance(data, dict) else None
+
+        required_fields = [
+            "time",
+            "weather_code",
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "precipitation_sum",
+            "precipitation_probability_max",
+        ]
+
+        if not isinstance(daily, dict):
+            raise ValueError("Open-Meteo response is missing daily forecast data.")
+
+        if any(field not in daily for field in required_fields):
+            raise ValueError("Open-Meteo response is missing required daily fields.")
+
+        if not daily["time"]:
+            raise ValueError("Open-Meteo returned an empty forecast.")
+
+        # Successful response: save to memory and PostgreSQL.
+        fetched_at = time.time()
+        _forecast_cache[key] = (fetched_at, data)
+        _persistent_forecast_set(key, data)
+
+        # Clear the cooldown after a successful response.
+        _weather_rate_limited_until = 0.0
+
+        log.info(
+            "Weather forecast successfully retrieved and cached for %.2f, %.2f",
+            lat,
+            lon,
+        )
+
+        return data
+
+    except HTTPException:
+        raise
+
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+        log.exception("Open-Meteo request or response processing failed: %r", exc)
+
+        # Fall back to cached data if it is less than 24 hours old.
+        if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
+            log.warning("Returning stale forecast because live weather failed.")
+            return cached[1]
+
+        raise HTTPException(
+            status_code=503,
+            detail="The weather provider is temporarily unavailable. Please try again later."
+        ) from exc
+
 
     params = {
         "latitude": lat,
