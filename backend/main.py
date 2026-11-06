@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import Boolean, DateTime, Float, String, create_engine, select
+from sqlalchemy import Boolean, DateTime, Float, JSON, String, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -108,6 +108,13 @@ class Farmer(Base):
     code_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     code_expires: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WeatherCache(Base):
+    __tablename__ = "weather_cache"
+    cache_key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 Base.metadata.create_all(engine)
@@ -449,23 +456,70 @@ FORECAST_STALE_TTL = 86400
 _weather_rate_limited_until = 0.0
 
 
+def _weather_cache_key(key: tuple) -> str:
+    """Stable database key for a rounded latitude/longitude pair."""
+    return f"{key[0]:.2f}:{key[1]:.2f}"
+
+
+def _persistent_forecast_get(key: tuple):
+    """Return (timestamp, payload) from PostgreSQL, or None if unavailable."""
+    try:
+        with SessionLocal() as session:
+            row = session.get(WeatherCache, _weather_cache_key(key))
+            if row is None or not isinstance(row.payload, dict):
+                return None
+            fetched_at = as_utc(row.fetched_at)
+            if fetched_at is None:
+                return None
+            return fetched_at.timestamp(), row.payload
+    except Exception:
+        # A cache-table problem must not prevent a live weather request.
+        log.exception("Could not read persistent weather cache")
+        return None
+
+
+def _persistent_forecast_set(key: tuple, payload: dict) -> None:
+    """Persist a successful provider response without making cache failure fatal."""
+    try:
+        with SessionLocal() as session:
+            row = session.get(WeatherCache, _weather_cache_key(key))
+            if row is None:
+                row = WeatherCache(
+                    cache_key=_weather_cache_key(key),
+                    payload=payload,
+                    fetched_at=utcnow(),
+                )
+                session.add(row)
+            else:
+                row.payload = payload
+                row.fetched_at = utcnow()
+            session.commit()
+    except Exception:
+        log.exception("Could not save persistent weather cache")
+
+
 async def forecast(lat: float, lon: float) -> dict:
     global _weather_rate_limited_until
 
     key = (round(lat, 2), round(lon, 2))
     now = time.time()
 
+    # Check process memory first, then PostgreSQL. PostgreSQL survives restarts.
     cached = _forecast_cache.get(key)
+    if cached is None:
+        cached = _persistent_forecast_get(key)
+        if cached is not None:
+            _forecast_cache[key] = cached
 
     # Return fresh cached weather without contacting Open-Meteo.
     if cached and now - cached[0] < FORECAST_TTL:
         return cached[1]
 
-    # Respect the provider cooldown.
+    # During a provider cooldown, return the last saved forecast if it is
+    # no more than 24 hours old.
     if now < _weather_rate_limited_until:
         if cached and now - cached[0] < FORECAST_STALE_TTL:
             return cached[1]
-
         raise HTTPException(
             status_code=503,
             detail="Weather service is temporarily busy. Please try again later."
@@ -489,51 +543,46 @@ async def forecast(lat: float, lon: float) -> dict:
 
     try:
         timeout = httpx.Timeout(25.0, connect=10.0)
-
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(
                 "https://api.open-meteo.com/v1/forecast",
                 params=params,
             )
 
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            try:
+                wait_seconds = max(900, int(retry_after))
+            except (TypeError, ValueError):
+                wait_seconds = 1800
+            _weather_rate_limited_until = time.time() + wait_seconds
 
-                try:
-                    wait_seconds = max(900, int(retry_after))
-                except (TypeError, ValueError):
-                    wait_seconds = 1800
+            if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
+                return cached[1]
 
-                _weather_rate_limited_until = time.time() + wait_seconds
+            raise HTTPException(
+                status_code=503,
+                detail="Weather service is temporarily busy. Please try again later."
+            )
 
-                if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
-                    return cached[1]
+        response.raise_for_status()
+        data = response.json()
 
-                raise HTTPException(
-                    status_code=503,
-                    detail="Weather service is temporarily busy. Please try again later."
-                )
+        if not isinstance(data, dict) or "daily" not in data or "current" not in data:
+            raise ValueError("Incomplete weather response from Open-Meteo")
 
-            response.raise_for_status()
-            data = response.json()
-
-            if not isinstance(data, dict) or "daily" not in data or "current" not in data:
-                raise ValueError("Incomplete weather response from Open-Meteo")
-
-            _forecast_cache[key] = (time.time(), data)
-            _weather_rate_limited_until = 0.0
-
-            return data
+        fetched_at = time.time()
+        _forecast_cache[key] = (fetched_at, data)
+        _persistent_forecast_set(key, data)
+        _weather_rate_limited_until = 0.0
+        return data
 
     except HTTPException:
         raise
-
     except (httpx.RequestError, httpx.HTTPStatusError, ValueError):
         log.exception("Open-Meteo weather request failed")
-
         if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
             return cached[1]
-
         raise HTTPException(
             status_code=503,
             detail="Weather service is temporarily unavailable. Please try again later."
