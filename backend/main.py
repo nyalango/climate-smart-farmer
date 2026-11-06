@@ -444,15 +444,39 @@ def login(body: LoginIn, s: Session = Depends(db)):
 
 # ── Forecasts (Open-Meteo) ───────────────────────────────────────────────────
 
+
+# ── Forecasts (Open-Meteo) ───────────────────────────────────────────────────
 _forecast_cache: dict[tuple, tuple[float, dict]] = {}
-FORECAST_TTL = 600
+
+FORECAST_TTL = 1800       # Keep successful forecasts for 30 minutes
+FORECAST_STALE_TTL = 86400  # Allow cached data up to 24 hours old
+
+# Prevent repeated requests while Open-Meteo is rate-limiting us.
+_weather_rate_limited_until = 0.0
+
 
 async def forecast(lat: float, lon: float) -> dict:
-    key = (round(lat, 2), round(lon, 2))
+    global _weather_rate_limited_until
 
-    hit = _forecast_cache.get(key)
-    if hit and time.time() - hit[0] < FORECAST_TTL:
-        return hit[1]
+    key = (round(lat, 2), round(lon, 2))
+    now = time.time()
+
+    cached = _forecast_cache.get(key)
+
+    # Return fresh cached data without contacting Open-Meteo.
+    if cached and now - cached[0] < FORECAST_TTL:
+        return cached[1]
+
+    # If the provider is rate-limiting us, use older cached data if available.
+    if now < _weather_rate_limited_until:
+        if cached and now - cached[0] < FORECAST_STALE_TTL:
+            log.warning("Using cached weather during provider rate limit.")
+            return cached[1]
+
+        raise HTTPException(
+            status_code=503,
+            detail="Weather service is temporarily busy. Please try again later."
+        )
 
     params = {
         "latitude": lat,
@@ -470,42 +494,65 @@ async def forecast(lat: float, lon: float) -> dict:
         ),
     }
 
-    timeout = httpx.Timeout(30.0, connect=10.0)
+    try:
+        timeout = httpx.Timeout(25.0, connect=10.0)
 
-    async with httpx.AsyncClient(
-        timeout=timeout,
-        follow_redirects=True,
-        headers={"User-Agent": "ClimateSmartFarmer/1.0"}
-    ) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params=params
+            )
 
-        for attempt in range(3):
-            try:
-                response = await client.get(
-                    "https://api.open-meteo.com/v1/forecast",
-                    params=params
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+
+                try:
+                    wait_seconds = max(900, int(retry_after))
+                except (TypeError, ValueError):
+                    wait_seconds = 1800
+
+                _weather_rate_limited_until = time.time() + wait_seconds
+
+                log.error(
+                    "Open-Meteo rate limit reached. Waiting %s seconds.",
+                    wait_seconds
                 )
-                response.raise_for_status()
-                data = response.json()
 
-                if "daily" not in data or "current" not in data:
-                    raise ValueError("Weather provider returned incomplete data")
+                if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
+                    log.warning("Returning cached forecast after HTTP 429.")
+                    return cached[1]
 
-                _forecast_cache[key] = (time.time(), data)
-                return data
-
-            except (httpx.RequestError, httpx.HTTPStatusError) as error:
-                if attempt == 2:
-                    log.exception("Open-Meteo failed after 3 attempts")
-                    raise
-
-                log.warning(
-                    "Weather request attempt %s failed: %r",
-                    attempt + 1,
-                    error
+                raise HTTPException(
+                    status_code=503,
+                    detail="Weather service is temporarily busy. Please try again later."
                 )
-                await asyncio.sleep(2 ** attempt)
 
-    raise RuntimeError("Weather provider unavailable")
+            response.raise_for_status()
+            data = response.json()
+
+            if not isinstance(data, dict) or "daily" not in data or "current" not in data:
+                raise ValueError("Incomplete weather response from Open-Meteo")
+
+            _forecast_cache[key] = (time.time(), data)
+            _weather_rate_limited_until = 0.0
+
+            return data
+
+    except HTTPException:
+        raise
+
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError):
+        log.exception("Open-Meteo weather request failed")
+
+        if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
+            log.warning("Returning cached forecast after provider failure.")
+            return cached[1]
+
+        raise HTTPException(
+            status_code=503,
+            detail="Weather service is temporarily unavailable. Please try again later."
+        )
+
 
 
 def weather_condition(code) -> str:
