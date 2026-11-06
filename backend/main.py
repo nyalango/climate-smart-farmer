@@ -632,9 +632,19 @@ def week_payload(data: dict, name: str) -> dict:
 async def _forecast_or_502(lat: float, lon: float) -> dict:
     try:
         return await forecast(lat, lon)
-    except Exception as e:  # network error, timeout, bad status from the provider
-        log.error("Open-Meteo request failed: %r", e)
-        raise HTTPException(502, "The weather provider is unavailable right now. Please try again.")
+
+    except HTTPException:
+        # Preserve intentional 503 and other HTTP errors.
+        raise
+
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as e:
+        log.exception("Open-Meteo request failed")
+
+        raise HTTPException(
+            status_code=503,
+            detail="The weather provider is temporarily unavailable. Please try again later."
+        ) from e
+
 
 
 @app.get("/forecast/today/{location_key}")
