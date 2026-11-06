@@ -549,45 +549,31 @@ async def forecast(lat: float, lon: float) -> dict:
                 params=params,
             )
 
-        if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After")
-            try:
-                wait_seconds = max(900, int(retry_after))
-            except (TypeError, ValueError):
-                wait_seconds = 1800
-            _weather_rate_limited_until = time.time() + wait_seconds
+if response.status_code == 429:
+    retry_after = response.headers.get("Retry-After")
 
-            if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
-                return cached[1]
+    log.error(
+        "Open-Meteo RATE LIMIT: status=%s, retry_after=%s, response=%s",
+        response.status_code,
+        retry_after,
+        response.text[:500],
+    )
 
-            raise HTTPException(
-                status_code=503,
-                detail="Weather service is temporarily busy. Please try again later."
-            )
+    try:
+        wait_seconds = max(900, int(retry_after))
+    except (TypeError, ValueError):
+        wait_seconds = 1800
 
-        response.raise_for_status()
-        data = response.json()
+    _weather_rate_limited_until = time.time() + wait_seconds
 
-        if not isinstance(data, dict) or "daily" not in data or "current" not in data:
-            raise ValueError("Incomplete weather response from Open-Meteo")
+    if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
+        log.warning("Returning stale PostgreSQL/memory weather cache.")
+        return cached[1]
 
-        fetched_at = time.time()
-        _forecast_cache[key] = (fetched_at, data)
-        _persistent_forecast_set(key, data)
-        _weather_rate_limited_until = 0.0
-        return data
-
-    except HTTPException:
-        raise
-    except (httpx.RequestError, httpx.HTTPStatusError, ValueError):
-        log.exception("Open-Meteo weather request failed")
-        if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
-            return cached[1]
-        raise HTTPException(
-            status_code=503,
-            detail="Weather service is temporarily unavailable. Please try again later."
-        )
-
+    raise HTTPException(
+        status_code=503,
+        detail="Weather service is temporarily busy. Please try again later."
+    )
 
 
 def weather_condition(code) -> str:
