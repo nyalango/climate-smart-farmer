@@ -442,16 +442,10 @@ def login(body: LoginIn, s: Session = Depends(db)):
     return {"access_token": token_for(f), "token_type": "bearer", "farmer": farmer_json(f)}
 
 
-# ── Forecasts (Open-Meteo) ───────────────────────────────────────────────────
-
-
-# ── Forecasts (Open-Meteo) ───────────────────────────────────────────────────
 _forecast_cache: dict[tuple, tuple[float, dict]] = {}
 
-FORECAST_TTL = 1800       # Keep successful forecasts for 30 minutes
-FORECAST_STALE_TTL = 86400  # Allow cached data up to 24 hours old
-
-# Prevent repeated requests while Open-Meteo is rate-limiting us.
+FORECAST_TTL = 1800
+FORECAST_STALE_TTL = 86400
 _weather_rate_limited_until = 0.0
 
 
@@ -463,14 +457,13 @@ async def forecast(lat: float, lon: float) -> dict:
 
     cached = _forecast_cache.get(key)
 
-    # Return fresh cached data without contacting Open-Meteo.
+    # Return fresh cached weather without contacting Open-Meteo.
     if cached and now - cached[0] < FORECAST_TTL:
         return cached[1]
 
-    # If the provider is rate-limiting us, use older cached data if available.
+    # Respect the provider cooldown.
     if now < _weather_rate_limited_until:
         if cached and now - cached[0] < FORECAST_STALE_TTL:
-            log.warning("Using cached weather during provider rate limit.")
             return cached[1]
 
         raise HTTPException(
@@ -500,7 +493,7 @@ async def forecast(lat: float, lon: float) -> dict:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(
                 "https://api.open-meteo.com/v1/forecast",
-                params=params
+                params=params,
             )
 
             if response.status_code == 429:
@@ -513,13 +506,7 @@ async def forecast(lat: float, lon: float) -> dict:
 
                 _weather_rate_limited_until = time.time() + wait_seconds
 
-                log.error(
-                    "Open-Meteo rate limit reached. Waiting %s seconds.",
-                    wait_seconds
-                )
-
                 if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
-                    log.warning("Returning cached forecast after HTTP 429.")
                     return cached[1]
 
                 raise HTTPException(
@@ -545,7 +532,6 @@ async def forecast(lat: float, lon: float) -> dict:
         log.exception("Open-Meteo weather request failed")
 
         if cached and time.time() - cached[0] < FORECAST_STALE_TTL:
-            log.warning("Returning cached forecast after provider failure.")
             return cached[1]
 
         raise HTTPException(
