@@ -4,6 +4,8 @@ Run from the backend folder:
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 (--host 0.0.0.0 is what lets a phone on the same Wi-Fi reach it.)
 """
+
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -430,8 +432,8 @@ def login(body: LoginIn, s: Session = Depends(db)):
     if len(recent) >= 8:
         raise HTTPException(429, "Too many failed sign-in attempts. Try again in 15 minutes.")
     f = s.scalar(select(Farmer).where(Farmer.email == email))
-    ok = check_password(body.password, f.password_hash if f else DUMMY_HASH) and f is not None
-    if not ok:
+    password_ok = check_password(body.password, f.password_hash if f else DUMMY_HASH)
+    if f is None or not password_ok:
         _login_failures[email] = recent + [now]
         raise HTTPException(401, "Email or password is incorrect.")
     _login_failures.pop(email, None)
@@ -441,26 +443,69 @@ def login(body: LoginIn, s: Session = Depends(db)):
 
 
 # ── Forecasts (Open-Meteo) ───────────────────────────────────────────────────
-_forecast_cache: dict[tuple, tuple[float, dict]] = {}
-FORECAST_TTL = 600  # seconds
 
+_forecast_cache: dict[tuple, tuple[float, dict]] = {}
+FORECAST_TTL = 600
 
 async def forecast(lat: float, lon: float) -> dict:
     key = (round(lat, 2), round(lon, 2))
+
     hit = _forecast_cache.get(key)
     if hit and time.time() - hit[0] < FORECAST_TTL:
         return hit[1]
+
     params = {
-        "latitude": lat, "longitude": lon, "timezone": "auto", "forecast_days": 7,
-        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max",
-        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code",
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": "auto",
+        "forecast_days": 7,
+        "daily": (
+            "weather_code,temperature_2m_max,temperature_2m_min,"
+            "precipitation_sum,precipitation_probability_max,"
+            "wind_speed_10m_max"
+        ),
+        "current": (
+            "temperature_2m,relative_humidity_2m,"
+            "wind_speed_10m,weather_code"
+        ),
     }
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
-        r.raise_for_status()
-        data = r.json()
-    _forecast_cache[key] = (time.time(), data)
-    return data
+
+    timeout = httpx.Timeout(30.0, connect=10.0)
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        headers={"User-Agent": "ClimateSmartFarmer/1.0"}
+    ) as client:
+
+        for attempt in range(3):
+            try:
+                response = await client.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params=params
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                if "daily" not in data or "current" not in data:
+                    raise ValueError("Weather provider returned incomplete data")
+
+                _forecast_cache[key] = (time.time(), data)
+                return data
+
+            except (httpx.RequestError, httpx.HTTPStatusError) as error:
+                if attempt == 2:
+                    log.exception("Open-Meteo failed after 3 attempts")
+                    raise
+
+                log.warning(
+                    "Weather request attempt %s failed: %r",
+                    attempt + 1,
+                    error
+                )
+                await asyncio.sleep(2 ** attempt)
+
+    raise RuntimeError("Weather provider unavailable")
 
 
 def weather_condition(code) -> str:
